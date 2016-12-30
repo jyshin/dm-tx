@@ -31,15 +31,18 @@
 #include <linux/workqueue.h>
 #include <scsi/sg.h>
 
-#include "lru-cache.h"
 #include "dm-tx-ioctl.h"
+#include "lru-cache.h"
 
+#define MAX_U32		0xFFFFFFFF
+#define MAX_U16		0xFFFF
+#define MAX_U8		0xFF
 
-#define MAX_DETAIL_LOG_LOOP_CNT 8
+#define POW_OF_2(number) (((number != 0) && (number & (number - 1))) == 0)
 
 #define MIN_JOBS_IN_POOL	1024
 #define MIN_PROCS_IN_POOL       128
-#define DM_TX_GC_COPY_PAGES  512
+#define DM_TX_GC_COPY_PAGES	512
 #define DM_TX_MAX_STRIPES	32
 #define MIN_GC_CONCURRENT_REQ   4
 #define GC_CONCURRENT_REQ       64
@@ -50,10 +53,6 @@
 #define DM_TX_CRITICAL_WATERMARK		1024
 #define DM_TX_CRITICAL_WATERMARK_HARD	8
 
-#define MAX_U32		0xFFFFFFFF
-#define MAX_U16		0xFFFF
-#define MAX_U8		0xFF
-
 #define TX_NO_VERSION		MAX_U32
 #define TX_READ_NO_VERSION	(MAX_U32 - 1)
 #define TX_WRITE_NO_VERSION	(MAX_U32 - 2)
@@ -61,10 +60,8 @@
 
 #define NUM_TX_IO_LIMIT 256
 
-#define POW_OF_2(number) (((number != 0) && (number & (number - 1))) == 0)
 
 #define DM_TX_PREFIX "dm-tx: "
-
 #define DM_TX_DEBUG 0
 #if DM_TX_DEBUG
 #define DPRINTK( s, arg... ) printk(DM_TX_PREFIX s "\n", ##arg)
@@ -82,7 +79,6 @@
 /* blocks the size of pages: PAGE_SHIFT 12 
  * sector size: SECTOR_SHIFT 9
  */
-
 #define GECKO_BLOCK_SHIFT PAGE_SHIFT
 #define GECKO_BLOCK_SIZE (1UL << GECKO_BLOCK_SHIFT)
 #define GECKO_SECTOR_SIZE (1UL << SECTOR_SHIFT)
@@ -108,55 +104,51 @@
 	"[memory cache policy: none|lru_rd|lru_rdwr] " \
 	"[memory cache size (MB): power of 2] "
 
+/* Hashtable for pending IO operations indexed by block number */
+#define HASH_TABLE_BITS 12
+#define HASH_TABLE_SIZE (1UL << HASH_TABLE_BITS)
+
 #define YOGURT_WRITE_WEIGHT	100
-/* mempool cache allocators */
-static struct kmem_cache *io_job_cache,
-			 *d_map_entry_cache, *proc_info_cache, *tx_record_cache,
-			 *tx_io_cache;
-static mempool_t *io_job_mempool,
-		 *d_map_entry_mempool, *proc_info_mempool, *tx_record_mempool,
-		 *tx_io_mempool;
-
-static inline sector_t sector_to_block(sector_t sector)
-{
-	return (sector >> GECKO_SECTOR_TO_BLOCK_SHIFT);
-}
-
-static inline sector_t block_to_sector(sector_t sector)
-{
-	return (sector << GECKO_SECTOR_TO_BLOCK_SHIFT);
-}
-
-static inline int sector_at_block_boundary(sector_t sector)
-{
-	return ((sector & GECKO_SECTOR_TO_BLOCK_MASK) == 0x0);
-}
-
-static inline int bio_start_at_block_boundary(struct bio *bio)
-{
-	return sector_at_block_boundary(bio->bi_sector);
-}
-
-static inline int bio_end_at_block_boundary(struct bio *bio)
-{
-	return sector_at_block_boundary(bio->bi_sector +
-					to_sector(bio->bi_size));
-}
-
-static inline int bio_at_block_boundary(struct bio *bio)
-{
-	return bio_start_at_block_boundary(bio)
-		&& bio_end_at_block_boundary(bio);
-}
-
-static inline int bio_single_block_at_block_boundary(struct bio *bio)
-{
-	return (bio->bi_size == GECKO_BLOCK_SIZE)
-		&& bio_at_block_boundary(bio);
-}
 
 
-struct dm_gecko;
+/*****************************************************************************\
+ * Global variables:
+ * Global memory cache and pools.
+ * Workqueue and related lists to interface between Gecko and isotope. 
+\*****************************************************************************/
+
+static struct kmem_cache *io_job_cache, *d_map_entry_cache, *proc_info_cache,
+			 *tx_record_cache, *tx_io_cache;
+static mempool_t *io_job_mempool, *d_map_entry_mempool, *proc_info_mempool,
+		 *tx_record_mempool, *tx_io_mempool;
+
+
+/* Interfaces between Gecko and Isotope */
+static struct workqueue_struct *io_finish_work_queue = NULL;
+static struct work_struct io_finish_work;
+
+static LIST_HEAD(finished_io_list);
+static DEFINE_SPINLOCK(finished_io_list_lock);
+
+static struct list_head *outstanding_io_job_list_map;
+static DEFINE_SPINLOCK(outstanding_io_job_list_map_lock);
+
+
+/*****************************************************************************\
+ * Gecko related structs.
+\*****************************************************************************/
+
+struct d_map_entry {
+	u32 phy_addr;
+	u32 version;
+	void *page;
+	struct list_head list;
+};
+
+struct r_map_entry {
+	u32 virt_addr;
+	u32 version;
+};
 
  /* TODO explicitly support segments */
 struct dm_dev_info {
@@ -172,48 +164,21 @@ struct dm_dev_info {
 	sector_t head;
 };
 
-
 struct phy_dev_map {
 	sector_t len;                /* total linear length in sectors */
 	int cnt;                     /* number of blk devs */
 	struct list_head dm_dev_info_list;
 };
 
-/* Hashtable for pending IO operations indexed by block number */
-#define HASH_TABLE_BITS 12
-#define HASH_TABLE_SIZE (1UL << HASH_TABLE_BITS)
-
-struct dm_gecko_stats {
-	unsigned long long reads, subblock_reads, writes, subblock_writes,
-		      gc, discards, dropped_discards, empty_barriers,
-		      gc_recycle, rw_clash, rw_gc_clash, gc_clash, gc_rw_clash,
-		      ww_clash, read_empty, read_err, write_err, kcopyd_err,
-		      sb_read, sb_write, tx_success, tx_failure;
-};
-
-// TODO: replace dm_gecko_stats with the stats below.
-struct dm_gecko_new_stats {
-	unsigned long long reads, writes, gc, discards, empty_barriers,
-		      gc_recycle, rw_clash, rw_gc_clash, gc_clash, gc_rw_clash,
-		      ww_clash, read_empty, read_err, write_err;
-};
-
-struct dm_isotope_stats {
-	unsigned long long tx_reads, subblock_reads, tx_writes, subblock_writes,
-		      readwrite_tx, writeonly_tx, readonly_tx,
-		      tx_success, tx_failure, tx_abort;
-};
-
-struct dm_tx_stats {
-	unsigned long long flushes, discards,
-		      reads, subblock_reads,
-		      writes, subblock_writes,
-		      read_err, write_err;
-};
-
 struct gc_ctrl {
 	u32 low_watermark;
 	u32 high_watermark;
+};
+
+struct dm_gecko_stats {
+	unsigned long long reads, writes, gc, discards, empty_barriers,
+		      gc_recycle, rw_clash, rw_gc_clash, gc_clash, gc_rw_clash,
+		      ww_clash, read_empty, read_err, write_err;
 };
 
 enum {  // dm_gecko->flags bit positions
@@ -222,89 +187,6 @@ enum {  // dm_gecko->flags bit positions
 	DM_TX_GC_STARTED,
 	DM_TX_INDEPENDENT_GC,
 	DM_TX_SYNCING_METADATA,
-};
-
-struct d_map_entry {
-	u32 phy_addr;
-	u32 version;
-	void *page;
-	struct list_head list;
-};
-
-struct r_map_entry {
-	u32 virt_addr;
-	u32 version;
-};
-
-static struct workqueue_struct *io_finish_work_queue = NULL;
-static struct work_struct io_finish_work;
-
-static LIST_HEAD(finished_io_list);
-static DEFINE_SPINLOCK(finished_io_list_lock);
-
-static struct list_head *outstanding_io_job_list_map;
-static DEFINE_SPINLOCK(outstanding_io_job_list_map_lock);
-
-enum {
-	BLKDEV_LAYOUT_GECKO,
-	BLKDEV_LAYOUT_LINEAR,
-};
-
-struct ctr_args {
-	int persistent;
-	char *meta_filename;
-
-	char *blkdev_layout;
-	int nr_blkdevs;
-	char *blkdev_paths[DM_TX_MAX_STRIPES];
-
-	// for gecko use only
-	int seg_size_mb;
-
-	char *ssd_cache_policy;
-	char *ssd_cache_path;
-	int ssd_cache_size_mb;
-
-	char *mem_cache_policy;
-	int mem_cache_size_mb;
-};
-
-struct dm_isotope {
-	atomic_t nr_outstanding_io;	// Number of outstanding I/O
-	wait_queue_head_t io_finish_wait_queue;
-
-	u32 request_id;		// Used for tagging I/O requests
-
-	u64 curr_ver;		// Currently visible version to users 
-	u64 outstanding_ver;	// Latest version that is being committed
-	u64 oldest_ver;		// Oldest available version (GC limit)
-
-	struct list_head tx_record_list;	// Completed tx records
-	struct list_head tx_proc_info_list;	// List of proc_info doing tx
-
-	struct list_head *proc_info_list_map;	// Chained hashmap for all
-						// proc_info
-	u32 nr_proc;		// Number of items in proc_info_list_map
-
-	struct list_head *tmp_proc_info_list_map; // Chained hashmap for
-						  // proc_info that is released
-						  //  and waiting to be
-						  // taken over
-	u32 nr_tmp_proc;	// Number of items in tmp_proc_info_list_map
-
-	spinlock_t request_id_lock;
-	spinlock_t version_lock;	// locks curr_ver, outstanding_ver
-					// and oldest_ver
-
-	spinlock_t tx_record_list_lock;		// locks tx_record_list,
-						// txr->success, txr->state,
-						// and, txr->end_ver.
-	spinlock_t tx_proc_info_list_lock;	// locks tx_proc_info_list
-	spinlock_t proc_info_list_map_lock;	// locks proc_info_list_map, 
-						// and nr_proc
-	spinlock_t tmp_proc_info_list_map_lock; // locks tmp_proc_info_list_map
-						// and nr_tmp_proc
-	struct dm_isotope_stats *stats;
 };
 
 struct dm_gecko {
@@ -342,24 +224,13 @@ struct dm_gecko {
 	unsigned long tail_wrap_around;
 	unsigned long head_wrap_around;
 
-	struct dm_gecko_new_stats *stats;
+	struct dm_gecko_stats *stats;
 };
 
-struct dm_tx {
-	struct dm_isotope *dmi;
-	struct dm_gecko *dmg;
 
-	volatile unsigned long flags;
-	int persistent;
-	char *meta_filename;
-	int blkdev_layout;
-	struct dm_tx_stats *stats;
-};
-
-enum {  // proc_info->flags bit positions
-	PROC_INFO_TRANSACTION = 0,
-	PROC_INFO_STALEREAD = 1,
-};
+/*****************************************************************************\
+ * Isotope related structs.
+\*****************************************************************************/
 
 struct tx_io {
 	int rw;
@@ -411,6 +282,11 @@ struct tx_record {
 	spinlock_t lock;
 };
 
+enum {  // proc_info->flags bit positions
+	PROC_INFO_TRANSACTION = 0,
+	PROC_INFO_STALEREAD = 1,
+};
+
 struct proc_info {
 	pid_t pid;
 
@@ -429,6 +305,55 @@ struct proc_info {
 	struct list_head pi_list; /* hook to dmi->proc_info_list_map */
 	struct list_head tt_list; /* hook to dmi->tx_proc_info_list */
 };
+
+struct dm_isotope_stats {
+	unsigned long long tx_reads, subblock_reads, tx_writes, subblock_writes,
+		      readwrite_tx, writeonly_tx, readonly_tx,
+		      tx_success, tx_failure, tx_abort;
+};
+
+struct dm_isotope {
+	atomic_t nr_outstanding_io;	// Number of outstanding I/O
+	wait_queue_head_t io_finish_wait_queue;
+
+	u32 request_id;		// Used for tagging I/O requests
+
+	u64 curr_ver;		// Currently visible version to users 
+	u64 outstanding_ver;	// Latest version that is being committed
+	u64 oldest_ver;		// Oldest available version (GC limit)
+
+	struct list_head tx_record_list;	// Completed tx records
+	struct list_head tx_proc_info_list;	// List of proc_info doing tx
+
+	struct list_head *proc_info_list_map;	// Chained hashmap for all
+						// proc_info
+	u32 nr_proc;		// Number of items in proc_info_list_map
+
+	struct list_head *tmp_proc_info_list_map; // Chained hashmap for
+						  // proc_info that is released
+						  //  and waiting to be
+						  // taken over
+	u32 nr_tmp_proc;	// Number of items in tmp_proc_info_list_map
+
+	spinlock_t request_id_lock;
+	spinlock_t version_lock;	// locks curr_ver, outstanding_ver
+					// and oldest_ver
+
+	spinlock_t tx_record_list_lock;		// locks tx_record_list,
+						// txr->success, txr->state,
+						// and, txr->end_ver.
+	spinlock_t tx_proc_info_list_lock;	// locks tx_proc_info_list
+	spinlock_t proc_info_list_map_lock;	// locks proc_info_list_map, 
+						// and nr_proc
+	spinlock_t tmp_proc_info_list_map_lock; // locks tmp_proc_info_list_map
+						// and nr_tmp_proc
+	struct dm_isotope_stats *stats;
+};
+
+
+/*****************************************************************************\
+ * Dm-tx related structs.
+\*****************************************************************************/
 
 #define IO_JOB_READ_MODIFY_WRITE	0x01
 #define IO_JOB_SUBBLOCK_READ		0x02
@@ -463,6 +388,95 @@ struct io_job {
 	sector_t old_l_block;			// old linear block for gc
 	int err;
 };
+
+// Currently not used
+struct dm_tx_stats {
+	unsigned long long flushes, discards, reads, subblock_reads,
+		      writes, subblock_writes, read_err, write_err;
+};
+
+struct ctr_args {
+	int persistent;
+	char *meta_filename;
+
+	char *blkdev_layout;
+	int nr_blkdevs;
+	char *blkdev_paths[DM_TX_MAX_STRIPES];
+
+	// for gecko use only
+	int seg_size_mb;
+
+	char *ssd_cache_policy;
+	char *ssd_cache_path;
+	int ssd_cache_size_mb;
+
+	char *mem_cache_policy;
+	int mem_cache_size_mb;
+};
+
+enum {
+	BLKDEV_LAYOUT_GECKO,
+	BLKDEV_LAYOUT_LINEAR,
+};
+
+struct dm_tx {
+	struct dm_isotope *dmi;
+	struct dm_gecko *dmg;
+
+	volatile unsigned long flags;
+	int persistent;
+	char *meta_filename;
+	int blkdev_layout;
+	struct dm_tx_stats *stats;
+};
+
+
+/*****************************************************************************\
+ * Sector and block operations
+\*****************************************************************************/
+
+static inline sector_t sector_to_block(sector_t sector)
+{
+	return (sector >> GECKO_SECTOR_TO_BLOCK_SHIFT);
+}
+
+static inline sector_t block_to_sector(sector_t sector)
+{
+	return (sector << GECKO_SECTOR_TO_BLOCK_SHIFT);
+}
+
+static inline int sector_at_block_boundary(sector_t sector)
+{
+	return ((sector & GECKO_SECTOR_TO_BLOCK_MASK) == 0x0);
+}
+
+static inline int bio_start_at_block_boundary(struct bio *bio)
+{
+	return sector_at_block_boundary(bio->bi_sector);
+}
+
+static inline int bio_end_at_block_boundary(struct bio *bio)
+{
+	return sector_at_block_boundary(bio->bi_sector +
+					to_sector(bio->bi_size));
+}
+
+static inline int bio_at_block_boundary(struct bio *bio)
+{
+	return bio_start_at_block_boundary(bio)
+		&& bio_end_at_block_boundary(bio);
+}
+
+static inline int bio_single_block_at_block_boundary(struct bio *bio)
+{
+	return (bio->bi_size == GECKO_BLOCK_SIZE)
+		&& bio_at_block_boundary(bio);
+}
+
+
+/*****************************************************************************\
+ * io_job type operations
+\*****************************************************************************/
 
 static inline void set_io_job_read_modify_write(struct io_job *io)
 {
@@ -505,28 +519,85 @@ static inline int is_io_job_gc(struct io_job *io)
 	return (io->type & IO_JOB_GC);
 }
 
+/*****************************************************************************\
+ * Utility functions
+\*****************************************************************************/
+
 static inline int list_is_only_item(struct list_head *item,
 				    struct list_head *head)
 {
 	return ((item->next == head) && (item->prev == head));
 }
 
-static inline void init_tx_record(struct tx_record *txr, u32 start_ver)
+static void memcpy_bio_into_page(struct io_job *io)
 {
-	txr->nest_count = 0;
-	txr->start_ver = start_ver;
-	txr->end_ver = 0;
-	INIT_LIST_HEAD(&txr->io_list);
-	txr->success = 0;
-	txr->fail_all_successors = 0;
-	txr->state = 0;
-	txr->nr_reads = 0;
-	txr->nr_writes = 0;
-	txr->nr_tx_to_wait = 0;
-	txr->nr_accessed_bytes = 0;
-	init_waitqueue_head(&txr->prior_tx_wait_queue);
-	spin_lock_init(&txr->lock);
+	int i;
+	struct bio_vec *bvec;
+	struct bio *bio = io->bio;
+	char *addr = io->page
+		+ to_bytes(bio->bi_sector & GECKO_SECTOR_TO_BLOCK_MASK);
+	bio_for_each_segment(bvec, bio, i) {
+		unsigned long flags;
+		char *bio_addr = bvec_kmap_irq(bvec, &flags);
+		memcpy(addr, bio_addr, bvec->bv_len);
+		bvec_kunmap_irq(bio_addr, &flags);
+		addr += bvec->bv_len;
+	}
 }
+
+static void memcpy_page_into_bio(struct io_job *io)
+{
+	int i;
+	struct bio_vec *bvec;
+	struct bio *bio = io->bio;
+	char *addr = io->page
+		+ to_bytes(bio->bi_sector & GECKO_SECTOR_TO_BLOCK_MASK);
+	bio_for_each_segment(bvec, bio, i) {
+		unsigned long flags;
+		char *bio_addr = bvec_kmap_irq(bvec, &flags);
+		memcpy(bio_addr, addr, bvec->bv_len);
+		bvec_kunmap_irq(bio_addr, &flags);
+		addr += bvec->bv_len;
+	}
+}
+
+static void memcpy_bio_into_reg_page(struct io_job *io, void *page)
+{
+	int i;
+	struct bio_vec *bvec;
+	struct bio *bio = io->bio;
+	char *addr =
+		page + to_bytes(bio->bi_sector & GECKO_SECTOR_TO_BLOCK_MASK);
+	bio_for_each_segment(bvec, bio, i) {
+		unsigned long flags;
+		char *bio_addr = bvec_kmap_irq(bvec, &flags);
+		memcpy(addr, bio_addr, bvec->bv_len);
+		bvec_kunmap_irq(bio_addr, &flags);
+		addr += bvec->bv_len;
+	}
+}
+
+static void memcpy_reg_page_into_bio(struct io_job *io, void *page)
+{
+	int i;
+	struct bio_vec *bvec;
+	struct bio *bio = io->bio;
+	char *addr =
+		page + to_bytes(bio->bi_sector & GECKO_SECTOR_TO_BLOCK_MASK);
+	bio_for_each_segment(bvec, bio, i) {
+		unsigned long flags;
+		char *bio_addr = bvec_kmap_irq(bvec, &flags);
+		memcpy(bio_addr, addr, bvec->bv_len);
+		bvec_kunmap_irq(bio_addr, &flags);
+		addr += bvec->bv_len;
+	}
+}
+
+
+
+/*****************************************************************************\
+ * version operations
+\*****************************************************************************/
 
 static inline u32 mark_version_pending(void)
 {
@@ -546,6 +617,63 @@ static inline int is_version_tx_write(u32 version)
 static inline int is_version_tx_read(u32 version)
 {
 	return (version == TX_READ_NO_VERSION);
+}
+
+static u32 get_oldest_ver_in_use(struct dm_isotope *dmi)
+{
+	unsigned long flags;
+	struct proc_info *pi;
+	u32 version = MAX_VERSION;
+
+	spin_lock_irqsave(&dmi->tx_proc_info_list_lock, flags);
+	list_for_each_entry(pi, &dmi->tx_proc_info_list, tt_list) {
+		if (pi->ver_opened < version) {
+			BUG_ON(is_version_pending(pi->ver_opened));
+			version = pi->ver_opened;
+		}
+	}
+	spin_unlock_irqrestore(&dmi->tx_proc_info_list_lock, flags);
+	return version;
+}
+
+static inline u32 __inc_and_get_curr_ver(struct dm_gecko *dmg)
+{
+	return (++dmg->curr_ver);
+}
+
+static inline u32 __inc_and_get_outstanding_ver(struct dm_isotope *dmi)
+{
+	u32 outstanding_ver;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dmi->version_lock, flags);
+	BUG_ON(dmi->outstanding_ver < dmi->curr_ver);
+
+	outstanding_ver = ++dmi->outstanding_ver;
+	spin_unlock_irqrestore(&dmi->version_lock, flags);
+
+	return outstanding_ver;
+}
+
+/*****************************************************************************\
+ * tx_record and proc_info operations
+\*****************************************************************************/
+
+static inline void init_tx_record(struct tx_record *txr, u32 start_ver)
+{
+	txr->nest_count = 0;
+	txr->start_ver = start_ver;
+	txr->end_ver = 0;
+	INIT_LIST_HEAD(&txr->io_list);
+	txr->success = 0;
+	txr->fail_all_successors = 0;
+	txr->state = 0;
+	txr->nr_reads = 0;
+	txr->nr_writes = 0;
+	txr->nr_tx_to_wait = 0;
+	txr->nr_accessed_bytes = 0;
+	init_waitqueue_head(&txr->prior_tx_wait_queue);
+	spin_lock_init(&txr->lock);
 }
 
 
@@ -570,22 +698,54 @@ static inline int is_transaction_ongoing(struct proc_info *pi)
 	return test_bit(PROC_INFO_TRANSACTION, &pi->flags);
 }
 
-static u32 get_oldest_ver_in_use(struct dm_isotope *dmi)
+/* operation on proc_info_list_map hash table */
+static struct proc_info *get_proc_info(struct dm_isotope *dmi,
+				       pid_t pid)
 {
-	unsigned long flags;
 	struct proc_info *pi;
-	u32 version = MAX_VERSION;
+	unsigned long flags;
+	unsigned long idx = hash_long(pid, HASH_TABLE_BITS);
+	struct list_head *proc_info_list = &dmi->proc_info_list_map[idx];
 
-	spin_lock_irqsave(&dmi->tx_proc_info_list_lock, flags);
-	list_for_each_entry(pi, &dmi->tx_proc_info_list, tt_list) {
-		if (pi->ver_opened < version) {
-			BUG_ON(is_version_pending(pi->ver_opened));
-			version = pi->ver_opened;
+	spin_lock_irqsave(&dmi->proc_info_list_map_lock, flags);
+	list_for_each_entry(pi, proc_info_list, pi_list) {
+		if (pi->pid == pid) {
+			spin_unlock_irqrestore(&dmi->proc_info_list_map_lock,
+					       flags);
+			return pi;
 		}
 	}
-	spin_unlock_irqrestore(&dmi->tx_proc_info_list_lock, flags);
-	return version;
+	spin_unlock_irqrestore(&dmi->proc_info_list_map_lock, flags);
+	return NULL;
 }
+
+/* WARNING: duplicates are not checked. */
+static void put_proc_info(struct dm_isotope *dmi,
+			  struct proc_info *pi)
+{
+	unsigned long flags;
+	unsigned long idx = hash_long(pi->pid, HASH_TABLE_BITS);
+	struct list_head *proc_info_list = &dmi->proc_info_list_map[idx];
+
+	spin_lock_irqsave(&dmi->proc_info_list_map_lock, flags);
+	list_add_tail(&pi->pi_list, proc_info_list);
+	++dmi->nr_proc;
+	spin_unlock_irqrestore(&dmi->proc_info_list_map_lock, flags);
+}
+
+static void remove_proc_info(struct dm_isotope *dmi, struct proc_info *pi)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&dmi->proc_info_list_map_lock, flags);
+	list_del(&pi->pi_list);
+	--dmi->nr_proc;
+	spin_unlock_irqrestore(&dmi->proc_info_list_map_lock, flags);
+}
+
+
+/*****************************************************************************\
+ * sector and block device  operations
+\*****************************************************************************/
 
 static inline int sector_in_dev(sector_t sector, struct dm_dev_info *dev)
 {
@@ -633,6 +793,11 @@ static struct dm_dev_info * linear_to_phy(struct dm_gecko *dmg, sector_t sector,
 	return dev;
 }
 
+
+/*****************************************************************************\
+ * Simple block  operations
+\*****************************************************************************/
+
 static inline u32 mark_block_free(struct dm_gecko *dmg)
 {
 	return dmg->size;
@@ -664,6 +829,25 @@ static inline int __no_available_blocks_hard(struct dm_gecko *dmg)
 	return (dmg->available_blocks <= DM_TX_CRITICAL_WATERMARK_HARD);
 }
 
+static inline u32 __relocatable_blocks(struct dm_gecko *dmg)
+{
+	return dmg->free_blocks - dmg->available_blocks;
+}
+
+static inline u32 __unavailable_blocks(struct dm_gecko *dmg)
+{
+	return dmg->size - dmg->available_blocks;
+}
+
+static inline u32 __used_blocks(struct dm_gecko *dmg)
+{
+	return dmg->size - dmg->free_blocks;
+}
+
+
+/*****************************************************************************\
+ * r_map and d_list_map operations
+\*****************************************************************************/
 
 static inline void mark_r_map_entry_free(struct dm_gecko *dmg, u32 l_block)
 {
@@ -734,9 +918,6 @@ static inline u32 __get_latest_version(struct dm_gecko *dmg, u32 v_block)
 	}
 }
 
-/* 
- * version specifies the specific snapshot the caller wants to read.
- */
 static inline u32 __get_old_l_block(struct dm_gecko *dmg, u32 v_block,
 				    u32 version)
 {
@@ -773,6 +954,7 @@ static inline u32 __get_old_version_limit(struct dm_gecko *dmg, u32 v_block,
 		return TX_NO_VERSION;
 	}
 }
+
 static inline void * __get_old_l_block_page(struct dm_gecko *dmg, u32 v_block,
 					    u32 version)
 {
@@ -789,25 +971,6 @@ static inline void * __get_old_l_block_page(struct dm_gecko *dmg, u32 v_block,
 		}
 		return NULL;
 	}
-}
-
-static inline u32 __inc_and_get_curr_ver(struct dm_gecko *dmg)
-{
-	return (++dmg->curr_ver);
-}
-
-static inline u32 __inc_and_get_outstanding_ver(struct dm_isotope *dmi)
-{
-	u32 outstanding_ver;
-	unsigned long flags;
-
-	spin_lock_irqsave(&dmi->version_lock, flags);
-	BUG_ON(dmi->outstanding_ver < dmi->curr_ver);
-
-	outstanding_ver = ++dmi->outstanding_ver;
-	spin_unlock_irqrestore(&dmi->version_lock, flags);
-
-	return outstanding_ver;
 }
 
 /* lock must be held */
@@ -872,8 +1035,6 @@ struct d_map_entry * __insert_new_d_map_entry(struct dm_gecko *dmg, u32 v_block,
 
 	return new_entry;
 }
-
-
 
 /* lock must be held */
 static inline void __remove_d_map_entry(struct dm_gecko *dmg,
@@ -971,8 +1132,6 @@ static void notify_finished_io(struct io_job *io)
 	queue_work(io_finish_work_queue, &io_finish_work);
 }
 
-static void memcpy_bio_into_page(struct io_job *io);
-static void memcpy_page_into_bio(struct io_job *io);
 static void submit_io_job_to_gecko_backend(struct dm_gecko *dmg,
 					   struct io_job *io);
 
@@ -1089,66 +1248,6 @@ static void finish_io(struct work_struct *unused_work_struct)
 	spin_unlock_irqrestore(&finished_io_list_lock, flags);
 }
 
-/* operation on proc_info_list_map hash table */
-static struct proc_info *get_proc_info(struct dm_isotope *dmi,
-				       pid_t pid)
-{
-	struct proc_info *pi;
-	unsigned long flags;
-	unsigned long idx = hash_long(pid, HASH_TABLE_BITS);
-	struct list_head *proc_info_list = &dmi->proc_info_list_map[idx];
-
-	spin_lock_irqsave(&dmi->proc_info_list_map_lock, flags);
-	list_for_each_entry(pi, proc_info_list, pi_list) {
-		if (pi->pid == pid) {
-			spin_unlock_irqrestore(&dmi->proc_info_list_map_lock,
-					       flags);
-			return pi;
-		}
-	}
-	spin_unlock_irqrestore(&dmi->proc_info_list_map_lock, flags);
-	return NULL;
-}
-
-/* WARNING: duplicates are not checked for, you have been advised,
- * play nice */
-static void put_proc_info(struct dm_isotope *dmi,
-			  struct proc_info *pi)
-{
-	unsigned long flags;
-	unsigned long idx = hash_long(pi->pid, HASH_TABLE_BITS);
-	struct list_head *proc_info_list = &dmi->proc_info_list_map[idx];
-
-	spin_lock_irqsave(&dmi->proc_info_list_map_lock, flags);
-	list_add_tail(&pi->pi_list, proc_info_list);
-	++dmi->nr_proc;
-	spin_unlock_irqrestore(&dmi->proc_info_list_map_lock, flags);
-}
-
-static void remove_proc_info(struct dm_isotope *dmi, struct proc_info *pi)
-{
-	unsigned long flags;
-	spin_lock_irqsave(&dmi->proc_info_list_map_lock, flags);
-	list_del(&pi->pi_list);
-	--dmi->nr_proc;
-	spin_unlock_irqrestore(&dmi->proc_info_list_map_lock, flags);
-}
-
-static inline u32 __relocatable_blocks(struct dm_gecko *dmg)
-{
-	return dmg->free_blocks - dmg->available_blocks;
-}
-
-static inline u32 __unavailable_blocks(struct dm_gecko *dmg)
-{
-	return dmg->size - dmg->available_blocks;
-}
-
-static inline u32 __used_blocks(struct dm_gecko *dmg)
-{
-	return dmg->size - dmg->free_blocks;
-}
-
 /* Allocate/claim the next contiguously available block for writing or
    gc.  Do not need to check if the circular ring is full, since
    ->available_blocks is consistently updated and it indicates how
@@ -1177,22 +1276,6 @@ static  u32 __claim_next_free_block(struct dm_gecko *dmg)
 	--dmg->free_blocks;
 
 	return head;
-}
-
-static void memcpy_bio_into_reg_page(struct io_job *io, void *page)
-{
-	int i;
-	struct bio_vec *bvec;
-	struct bio *bio = io->bio;
-	char *addr =
-		page + to_bytes(bio->bi_sector & GECKO_SECTOR_TO_BLOCK_MASK);
-	bio_for_each_segment(bvec, bio, i) {
-		unsigned long flags;
-		char *bio_addr = bvec_kmap_irq(bvec, &flags);
-		memcpy(addr, bio_addr, bvec->bv_len);
-		bvec_kunmap_irq(bio_addr, &flags);
-		addr += bvec->bv_len;
-	}
 }
 
 /* ->lock must be held */
@@ -1249,38 +1332,6 @@ err_out:
 	return -ENOMEM;
 }
 
-static void memcpy_bio_into_page(struct io_job *io)
-{
-	int i;
-	struct bio_vec *bvec;
-	struct bio *bio = io->bio;
-	char *addr = io->page
-		+ to_bytes(bio->bi_sector & GECKO_SECTOR_TO_BLOCK_MASK);
-	bio_for_each_segment(bvec, bio, i) {
-		unsigned long flags;
-		char *bio_addr = bvec_kmap_irq(bvec, &flags);
-		memcpy(addr, bio_addr, bvec->bv_len);
-		bvec_kunmap_irq(bio_addr, &flags);
-		addr += bvec->bv_len;
-	}
-}
-
-static void memcpy_page_into_bio(struct io_job *io)
-{
-	int i;
-	struct bio_vec *bvec;
-	struct bio *bio = io->bio;
-	char *addr = io->page
-		+ to_bytes(bio->bi_sector & GECKO_SECTOR_TO_BLOCK_MASK);
-	bio_for_each_segment(bvec, bio, i) {
-		unsigned long flags;
-		char *bio_addr = bvec_kmap_irq(bvec, &flags);
-		memcpy(bio_addr, addr, bvec->bv_len);
-		bvec_kunmap_irq(bio_addr, &flags);
-		addr += bvec->bv_len;
-	}
-}
-
 static void gecko_io_complete_callback(unsigned long err, void *context)
 {
 	struct io_job *io = (struct io_job *)context;
@@ -1296,7 +1347,7 @@ static void gecko_io_complete_callback(unsigned long err, void *context)
 	}
 
 	if (err) {
-		struct dm_gecko_new_stats *stats;
+		struct dm_gecko_stats *stats;
 		get_cpu();
 		stats = this_cpu_ptr(dmg->stats);
 		io->err = err;
@@ -1400,36 +1451,10 @@ static int dm_dispatch_io_bio(struct io_job *io, io_notify_fn io_complete_fn)
 	return dm_io(&iorq, nr_regions, &where, NULL);
 }
 
-static void memcpy_reg_page_into_bio(struct io_job *io, void *page)
-{
-	int i;
-	struct bio_vec *bvec;
-	struct bio *bio = io->bio;
-	char *addr =
-		page + to_bytes(bio->bi_sector & GECKO_SECTOR_TO_BLOCK_MASK);
-	bio_for_each_segment(bvec, bio, i) {
-		unsigned long flags;
-		char *bio_addr = bvec_kmap_irq(bvec, &flags);
-		memcpy(bio_addr, addr, bvec->bv_len);
-		bvec_kunmap_irq(bio_addr, &flags);
-		addr += bvec->bv_len;
-	}
-}
-
-static void prepare_to_send_to_backend(struct dm_isotope *dmi,
-				       struct io_job *io)
-{
-	unsigned long flags;
-	spin_lock_irqsave(&dmi->request_id_lock, flags);
-	io->id = dmi->request_id++;
-	spin_unlock_irqrestore(&dmi->request_id_lock, flags);
-	put_io_job_for_id(io->id, io);
-}
-
 static void submit_io_job_to_gecko_backend(struct dm_gecko *dmg,
 					   struct io_job *io)
 {
-	struct dm_gecko_new_stats *stats;
+	struct dm_gecko_stats *stats;
 	unsigned long flags;
 	int rw = io->rw;
 	u32 v_block = io->v_block;
@@ -1513,6 +1538,16 @@ static void submit_io_job_to_gecko_backend(struct dm_gecko *dmg,
 out_without_submitting_io:
 	notify_finished_io(io);
 	return;
+}
+
+static void prepare_to_send_to_backend(struct dm_isotope *dmi,
+				       struct io_job *io)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&dmi->request_id_lock, flags);
+	io->id = dmi->request_id++;
+	spin_unlock_irqrestore(&dmi->request_id_lock, flags);
+	put_io_job_for_id(io->id, io);
 }
 
 static void submit_io_job(struct io_job *io)
@@ -1688,7 +1723,7 @@ static int map_flush(struct dm_gecko *dmg, struct bio *bio,
 		     unsigned target_req_nr)
 {
 	struct dm_io_region where;
-	struct dm_gecko_new_stats *stats;
+	struct dm_gecko_stats *stats;
 	get_cpu();
 	stats = this_cpu_ptr(dmg->stats);
 	++stats->empty_barriers;
@@ -1717,7 +1752,7 @@ static int map_flush(struct dm_gecko *dmg, struct bio *bio,
 static int map_discard(struct dm_gecko *dmg, struct bio *bio)
 {
 	unsigned long flags;
-	struct dm_gecko_new_stats *stats;
+	struct dm_gecko_stats *stats;
 	u32 l_block;
 	sector_t v_block = sector_to_block(bio->bi_sector);
 
@@ -1892,7 +1927,7 @@ static int init_gecko(struct dm_target *ti, struct dm_gecko *dmg,
 	dmg->gc_ctrl.high_watermark = GC_DEFAULT_HIGH_WATERMARK;
 
 	// TODO: move stats from gecko to dmtx
-	if (!(dmg->stats = alloc_percpu(struct dm_gecko_new_stats))) {
+	if (!(dmg->stats = alloc_percpu(struct dm_gecko_stats))) {
 		ti->error = DM_TX_PREFIX "unable to alloc_percpu stats";
 		printk("%s\n", ti->error);
 		err = -ENOMEM;
@@ -2385,7 +2420,7 @@ static void dm_tx_status(struct dm_target *ti, status_type_t type,
 	struct dm_isotope *dmi = dmtx->dmi;
 	struct dm_gecko *dmg = dmtx->dmg;
 	int cpu, sz = 0;        /* sz is used by DMEMIT */
-	struct dm_gecko_new_stats agg_gecko_stats, *g_cursor;
+	struct dm_gecko_stats agg_gecko_stats, *g_cursor;
 	struct dm_isotope_stats agg_isotope_stats, *i_cursor;
 
 	memset(&agg_gecko_stats, 0, sizeof(agg_gecko_stats));

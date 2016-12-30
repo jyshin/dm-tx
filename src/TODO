@@ -1,0 +1,13 @@
+* Moderate priority:
+- Add singleton TX support for R/W operations called without begin/end TX.
+- Add metadata persistence.
+- Add garbage collection of log.
+- Clean up message function.
+
+* Low priority:
+- Add SSD cache support for Gecko.
+- Handling failure during TX commits.
+- Include accessed_bits to persistent TX records.
+- Handling completely filled data_bit cases during merge.
+- Redesign of locks to be fine-grained.
+- Persisting TX records into a software version disk

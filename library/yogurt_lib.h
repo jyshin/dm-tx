@@ -1,19 +1,19 @@
-#ifndef __ISOTOPE_PP_LIB_H__
-#define __ISOTOPE_PP_LIB_H__
+#ifndef __YOGURT_LIB_H__
+#define __YOGURT_LIB_H__
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <map>
 
 enum read_semantics {
-	ISOTOPE_PP_BOUNDED_STALENESS=0,
-	ISOTOPE_PP_MONOTONIC_READS=1,
-	ISOTOPE_PP_READ_MY_WRITES=2,
-	ISOTOPE_PP_FIXED=3,
+	YOGURT_BOUNDED_STALENESS=0,
+	YOGURT_MONOTONIC_READS=1,
+	YOGURT_READ_MY_WRITES=2,
+	YOGURT_FIXED=3,
 };
 enum read_write {
-	ISOTOPE_PP_READ = 0,
-	ISOTOPE_PP_WRITE = 1,
+	YOGURT_READ = 0,
+	YOGURT_WRITE = 1,
 };
 
 struct session {

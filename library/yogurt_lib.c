@@ -1,8 +1,8 @@
 #include <sys/ioctl.h>
 #include <string.h>
 
-#include "isotope_pp_lib.h"
-#include "../dm-tx-ioctl.h"
+#include "yogurt_lib.h"
+#include "../src/dm-tx-ioctl.h"
 
 
 unsigned int get_current_version(struct session *s)
@@ -19,7 +19,7 @@ unsigned int probe_costs(struct session *s, unsigned int block)
 	unsigned int min_version;
 	struct addr_versions avs;
 
-	if (s->read_semantic == ISOTOPE_PP_FIXED) {
+	if (s->read_semantic == YOGURT_FIXED) {
 		return 0;
 	}
 
@@ -43,9 +43,7 @@ unsigned int probe_costs(struct session *s, unsigned int block)
 			(s->version_upper_bound - s->version_lower_bound) /
 			(s->querying_budget - 1);
 		avs.versions[i] = version;
-		//fprintf(stdout, "[q %u] ", version);
 	}
-	//fprintf(stdout, "\n");
 	if(!ioctl(s->fd, DM_TX_IOC_TGQ_GETCOST, &avs)) {
 		for (i = 0; i < s->querying_budget
 		     && i < DM_TX_COST_QUERY_LIMIT; i++) {
@@ -56,14 +54,8 @@ unsigned int probe_costs(struct session *s, unsigned int block)
 					 s->version_lower_bound) /
 					(s->querying_budget - 1);
 			}
-			//fprintf(stdout, "[c %u] ", avs.versions[i]);
 		}
-	} else {
-		//fprintf(stderr, "Cost query failed\n");
 	}
-
-	//fprintf(stdout, "\nMin version %u", min_version);
-	//fprintf(stderr, "Min cost %u \n", min_cost);
 	return min_version;
 }
 
@@ -82,11 +74,11 @@ unsigned int get_version_limit(struct session *s, unsigned int block,
 void reset_version_range(struct session *s, uint64_t key)
 {
 	std::map<uint64_t, uint32_t>::iterator it;
-	if (s->read_semantic == ISOTOPE_PP_FIXED) {
+	if (s->read_semantic == YOGURT_FIXED) {
 		return;
 	}
 	s->version_upper_bound = get_current_version(s);
-	if (s->read_semantic == ISOTOPE_PP_BOUNDED_STALENESS) {
+	if (s->read_semantic == YOGURT_BOUNDED_STALENESS) {
 		s->version_lower_bound = s->version_upper_bound - s->limit;
 		return;
 	}
@@ -103,13 +95,13 @@ void reset_version_range(struct session *s, uint64_t key)
 void update_version_range(struct session *s, uint64_t key, unsigned int lower,
 			  unsigned int upper)
 {
-	if (s->read_semantic == ISOTOPE_PP_FIXED) {
+	if (s->read_semantic == YOGURT_FIXED) {
 		return;
 	}
-	if (s->read_semantic == ISOTOPE_PP_BOUNDED_STALENESS) {
+	if (s->read_semantic == YOGURT_BOUNDED_STALENESS) {
 		s->version_lower_bound = s->version_upper_bound - s->limit;
-	} else if (s->read_semantic == ISOTOPE_PP_MONOTONIC_READS ||
-		   s->read_semantic == ISOTOPE_PP_READ_MY_WRITES) {
+	} else if (s->read_semantic == YOGURT_MONOTONIC_READS ||
+		   s->read_semantic == YOGURT_READ_MY_WRITES) {
 		s->version_lower_bound = lower;
 	}
 	s->version_upper_bound = upper;
@@ -118,14 +110,14 @@ void update_version_range(struct session *s, uint64_t key, unsigned int lower,
 void update_lower_bound(struct session *s, uint64_t key, int rw,
 			unsigned int lower)
 {
-	if (s->read_semantic == ISOTOPE_PP_FIXED) {
+	if (s->read_semantic == YOGURT_FIXED) {
 		return;
 	}
-	if (s->read_semantic == ISOTOPE_PP_MONOTONIC_READS
-	    && rw == ISOTOPE_PP_READ) {
+	if (s->read_semantic == YOGURT_MONOTONIC_READS
+	    && rw == YOGURT_READ) {
 		s->version_map[key] = lower;
-	} else if (s->read_semantic == ISOTOPE_PP_READ_MY_WRITES
-		   && rw == ISOTOPE_PP_WRITE) {
+	} else if (s->read_semantic == YOGURT_READ_MY_WRITES
+		   && rw == YOGURT_WRITE) {
 		s->version_map[key] = lower;
 	}
 }
@@ -133,7 +125,7 @@ void update_lower_bound(struct session *s, uint64_t key, int rw,
 int open_snapshot(struct session *s, unsigned int version)
 {
 	if (!ioctl(s->fd, DM_TX_IOC_Q_BEGINFTX)) {
-		if (version > 0 && s->read_semantic != ISOTOPE_PP_FIXED) {
+		if (version > 0 && s->read_semantic != YOGURT_FIXED) {
 			if (!ioctl(s->fd, DM_TX_IOC_SQ_OPENVER, &version)) {
 				return 1; // success
 			}
@@ -145,7 +137,7 @@ int open_snapshot(struct session *s, unsigned int version)
 
 int change_snapshot(struct session *s, unsigned int version)
 {
-	if (s->read_semantic == ISOTOPE_PP_FIXED) {
+	if (s->read_semantic == YOGURT_FIXED) {
 		return 1;
 	}
 	if (!ioctl(s->fd, DM_TX_IOC_SQ_OPENVER, &version)) {

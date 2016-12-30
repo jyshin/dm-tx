@@ -7,7 +7,7 @@
 #include <sys/mman.h>
 //#include <sys/types.h>
 //#include <sys/stat.h>
-#include "../isotope_pp_lib.h"
+#include "../yogurt_lib.h"
 
 #define BLOCK_SIZE 4096
 
@@ -31,7 +31,7 @@ static int write_block(struct session *s, char *buffer, int val)
 	if(!(version = close_snapshot(s))) {
 		fprintf(stdout, "Failed to close snapshot.\n");
 	} else {
-		update_lower_bound(s, 0, ISOTOPE_PP_WRITE, version);
+		update_lower_bound(s, 0, YOGURT_WRITE, version);
 	}
 	fprintf(stdout, "[W-V(%u): \"%c\"]\t", version, buffer[0]);
 	return 1;
@@ -137,7 +137,7 @@ int main(int argc, char *argv[])
 	fd = open("/dev/mapper/dm-tx", O_DIRECT | O_RDWR);
 	assert(fd > 0);
 
-	s = init_session(fd, ISOTOPE_PP_MONOTONIC_READS, 7);
+	s = init_session(fd, YOGURT_MONOTONIC_READS, 7);
 	assert(s != NULL);
 
 	write_test(s, buffer);

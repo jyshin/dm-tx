@@ -42,7 +42,7 @@ int main(int argc, char *argv[])
                     MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 	assert (page != MAP_FAILED);
 
-	fd = open("/dev/mapper/gecko", O_DIRECT | O_RDWR);
+	fd = open("/dev/mapper/dm-tx", O_DIRECT | O_RDWR);
         assert (fd >= 0);
 
 	get_curr_ver(fd);

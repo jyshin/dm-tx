@@ -14,23 +14,12 @@
  * H means "sHift": switch T and Q atomically
  */
 
-#define DM_TX_IOC_Q_BEGINTX _IO(DM_TX_IOCTL_TYPE, 1)
-#define DM_TX_IOC_Q_ENDTX _IO(DM_TX_IOCTL_TYPE, 2)
 #define DM_TX_IOC_G_GETCURVER _IOR(DM_TX_IOCTL_TYPE, 3, unsigned int)
 #define DM_TX_IOC_G_GETOLDESTVER _IOR(DM_TX_IOCTL_TYPE, 4, unsigned int)
 #define DM_TX_IOC_SQ_SETOLDESTVER _IOW(DM_TX_IOCTL_TYPE, 5, unsigned int)
 
-//#define DM_TX_IOC_Q_CLOSE _IO(DM_TX_IOCTL_TYPE, 7)
-//#define DM_TX_IOC_SQ_BEGINSTALEREAD _IOW(DM_TX_IOCTL_TYPE, 8, unsigned int)
-//#define DM_TX_IOC_Q_ENDSTALEREAD _IO(DM_TX_IOCTL_TYPE, 9)
-//#define DM_TX_IOC_Q_BEGINSTX _IO(DM_TX_IOCTL_TYPE, 10)
-//#define DM_TX_IOC_Q_ENDSTX _IO(DM_TX_IOCTL_TYPE, 11)
-//#define DM_TX_IOC_Q_ABORTTX _IO(DM_TX_IOCTL_TYPE, 12)
-//#define DM_TX_IOC_Q_ABORTSTX _IO(DM_TX_IOCTL_TYPE, 13)
-
 // TX 
 #define DM_TX_IOC_Q_BEGINFTX _IO(DM_TX_IOCTL_TYPE, 14)
-//#define DM_TX_IOC_Q_ENDFTX _IO(DM_TX_IOCTL_TYPE, 15)
 #define DM_TX_IOC_Q_ABORTFTX _IO(DM_TX_IOCTL_TYPE, 16)
 #define DM_TX_IOC_GQ_ENDFTX _IOR(DM_TX_IOCTL_TYPE, 25, unsigned int)
 
@@ -68,23 +57,34 @@
 #define DM_TX_IOC_ID_SHIFT (DM_TX_IOC_SIZE_SHIFT		\
 				+ DM_TX_IOC_NR_SIZE_BITS)
 
-
-#define DM_TX_ENCODE_EXTDB_CODE(id, size, start, end)\
+// This macro generated command is used for DM_TX_IOC_SQ_SETDIRTYBITS ioctl calls.
+// This ioctl call actually sets accessed bits: it not only works for write but
+// also for reads. 
+//
+// id: I/O sequence number within a TX.
+// size: subblock size (= 2 ^ (size))
+// start: start position in subblock granularity
+// cnt: number of subblocks from start
+//
+// e.g. 5th write within a TX accessed two 512B subblocks within a 4KB block which are 
+// the fourth and the fifth subblocks. 
+// DM_TX_ENCODE_EXTAB_CODE(5, 9, 3, 2);
+#define DM_TX_ENCODE_EXTAB_CODE(id, size, start, cnt)\
 	(((id) << DM_TX_IOC_ID_SHIFT) |			\
 		((size) << DM_TX_IOC_SIZE_SHIFT) |		\
 		((start) << DM_TX_IOC_START_SHIFT) |		\
-		((end) << DM_TX_IOC_CNT_SHIFT))
+		((cnt) << DM_TX_IOC_CNT_SHIFT))
 
-#define DM_TX_EXTDB_ID(code) (((code) >> DM_TX_IOC_ID_SHIFT)  & \
+#define DM_TX_EXTAB_ID(code) (((code) >> DM_TX_IOC_ID_SHIFT)  & \
 					DM_TX_IOC_ID_MASK)
 
-#define DM_TX_EXTDB_SIZE(code) (((code) >> DM_TX_IOC_SIZE_SHIFT)  & \
+#define DM_TX_EXTAB_SIZE(code) (((code) >> DM_TX_IOC_SIZE_SHIFT)  & \
 					DM_TX_IOC_SIZE_MASK)
 
-#define DM_TX_EXTDB_START(code) (((code) >> DM_TX_IOC_START_SHIFT)  & \
+#define DM_TX_EXTAB_START(code) (((code) >> DM_TX_IOC_START_SHIFT)  & \
 					DM_TX_IOC_START_MASK)
 
-#define DM_TX_EXTDB_CNT(code) (((code) >> DM_TX_IOC_CNT_SHIFT)  & \
+#define DM_TX_EXTAB_CNT(code) (((code) >> DM_TX_IOC_CNT_SHIFT)  & \
 					DM_TX_IOC_CNT_MASK)
 
 #define DM_TX_COST_QUERY_LIMIT 7
@@ -93,7 +93,6 @@ struct addr_size {
 	unsigned int addr;
 	unsigned int size;
 };
-
 
 struct addr_versions {
 	unsigned int addr;

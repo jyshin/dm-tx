@@ -3713,11 +3713,11 @@ static int ioctl_setaccessedbits(struct dm_tx *dmtx, u32 arg)
 	struct tx_io *txio;
 	u32 idx = 0;
 
-	id = DM_TX_EXTDB_ID(arg);
-	shift = DM_TX_EXTDB_SIZE(arg);
+	id = DM_TX_EXTAB_ID(arg);
+	shift = DM_TX_EXTAB_SIZE(arg);
 	granularity = (1U << shift);
-	start = DM_TX_EXTDB_START(arg);
-	cnt = DM_TX_EXTDB_CNT(arg);
+	start = DM_TX_EXTAB_START(arg);
+	cnt = DM_TX_EXTAB_CNT(arg);
 
 	if ((1U << shift) > GECKO_SECTOR_SIZE) {
 		IOCPRINTK("shift is too large");

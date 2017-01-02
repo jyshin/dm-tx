@@ -596,7 +596,7 @@ static void memcpy_reg_page_into_bio(struct io_job *io, void *page)
 
 
 /*****************************************************************************\
- * version operations
+ * Version operations.
 \*****************************************************************************/
 
 static inline u32 mark_version_pending(void)
@@ -656,7 +656,7 @@ static inline u32 __inc_and_get_outstanding_ver(struct dm_isotope *dmi)
 }
 
 /*****************************************************************************\
- * tx_record and proc_info operations
+ * tx_record and proc_info operations.
 \*****************************************************************************/
 
 static inline void init_tx_record(struct tx_record *txr, u32 start_ver)
@@ -744,7 +744,7 @@ static void remove_proc_info(struct dm_isotope *dmi, struct proc_info *pi)
 
 
 /*****************************************************************************\
- * sector and block device  operations
+ * Sector and block device operations.
 \*****************************************************************************/
 
 static inline int sector_in_dev(sector_t sector, struct dm_dev_info *dev)
@@ -795,7 +795,7 @@ static struct dm_dev_info * linear_to_phy(struct dm_gecko *dmg, sector_t sector,
 
 
 /*****************************************************************************\
- * Simple block  operations
+ * Simple block operations.
 \*****************************************************************************/
 
 static inline u32 mark_block_free(struct dm_gecko *dmg)
@@ -846,7 +846,7 @@ static inline u32 __used_blocks(struct dm_gecko *dmg)
 
 
 /*****************************************************************************\
- * r_map and d_list_map operations
+ * r_map and d_list_map operations.
 \*****************************************************************************/
 
 static inline void mark_r_map_entry_free(struct dm_gecko *dmg, u32 l_block)
@@ -1049,7 +1049,7 @@ static inline void __remove_d_map_entry(struct dm_gecko *dmg,
 	kfree(entry);
 }
 
-/* lock must be held 
+/* lock must be held
  * This function is used to update the phy addr during gc.
  */
 static inline u32 __update_d_map_entry(struct dm_gecko *dmg, u32 v_block,
@@ -1080,6 +1080,10 @@ static inline struct d_map_entry * __get_d_map_entry(struct dm_gecko *dmg,
 
 	return NULL;
 }
+
+/*****************************************************************************\
+ * I/O handling functions.
+\*****************************************************************************/
 
 static void do_complete_generic(struct dm_tx *dmtx)
 {
@@ -1287,9 +1291,9 @@ static int __relocate_written_block(struct io_job *io)
 	BUG_ON(dmg->r_map[io->l_block].virt_addr != io->v_block);
 
 	// TODO: the version we get from put_new_d_map_entry does not
-	// work correctly if transactional writes are used together. 
+	// work correctly if transactional writes are used together.
 	// Transactional writes use outstanding_ver not curr_ver.
-	// Thus, make writes without begin end TX a singleton TX. 
+	// Thus, make writes without begin end TX a singleton TX.
 	// But this should be done in the isotope layer not here.
 	if (io->version == TX_NO_VERSION) {
 		entry = __insert_new_d_map_entry(dmg, io->v_block, io->l_block);
@@ -1377,7 +1381,7 @@ static void gecko_io_complete_callback(unsigned long err, void *context)
 			goto notify_and_out;
 		}
 
-		// Write data to cache 
+		// Write data to cache
 		if (dmg->lru_cache_size_blk > 0 &&
 		    dmg->lru_mem_cache->policy == LRU_CACHE_POLICY_READWRITE) {
 			lru_cache_write(dmg->lru_mem_cache, io->l_block,
@@ -1717,7 +1721,7 @@ bio_endio_and_out:
 
 /* This is the case when flush request comes in.
  * Since device mapper has multiple devices it should
- * redirect the request to appropriate device that 
+ * redirect the request to appropriate device that
  * holds the cached requests that need to be flushed */
 static int map_flush(struct dm_gecko *dmg, struct bio *bio,
 		     unsigned target_req_nr)
@@ -1811,6 +1815,11 @@ static int dm_tx_map(struct dm_target *ti, struct bio *bio)
 	}
 	return ret;
 }
+
+
+/*****************************************************************************\
+ * Initialization and destruction functions.
+\*****************************************************************************/
 
 static void dm_gecko_put_devices(struct dm_target *ti, struct dm_gecko *dmg)
 {
@@ -2403,6 +2412,11 @@ static void dm_tx_dtr(struct dm_target *ti)
 	printk(DM_TX_PREFIX "dm_tx_dtr done.\n");
 }
 
+
+/*****************************************************************************\
+ * Status and message handling functions.
+\*****************************************************************************/
+
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(3, 5, 0)
 static int dm_tx_status(struct dm_target *ti, status_type_t type,
 			char *result, unsigned int maxlen)
@@ -2590,6 +2604,11 @@ bad:
 	printk("%s\n", ti->error);
 	return -EINVAL;
 }
+
+
+/*****************************************************************************\
+ * ioctl functions: Isotope and Yogurt functions are here.
+\*****************************************************************************/
 
 static int ioctl_check(unsigned int cmd, unsigned long arg)
 {
@@ -3731,7 +3750,7 @@ static int ioctl_setaccessedbits(struct dm_tx *dmtx, u32 arg)
 
 	accessed_bytes = (GECKO_BLOCK_SIZE >> shift) >> 3;
 
-	IOCPRINTK("Set Dirty Bits id %u, gran %u (%u), start %u, cnt %u, dbytes %u", 
+	IOCPRINTK("Set Dirty Bits id %u, gran %u (%u), start %u, cnt %u, dbytes %u",
 		  id, granularity, shift, start, cnt, accessed_bytes);
 
 	pi = get_proc_info(dmi, current->pid);

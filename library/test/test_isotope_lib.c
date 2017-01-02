@@ -25,27 +25,66 @@ void test_get_versions(int fd) {
 	version = get_oldest_ver(fd);
 }
 
-void test_set_cached(int fd) {
+void test_set_cached(int fd, unsigned int addr) {
+	set_cached_block(fd, addr);
+}
+
+void test_release_takeover_tx(int fd, char *page, int block_size) {
+	int i;
+	int addrs_size = 8;
+	off_t addrs[] = {0, 1, 2, 3, 4, 5, 6, 7};
+	int ch = 'i';
+	unsigned int handle;
+	begin_tx(fd);
+
+	for (i = 0; i < addrs_size; i++) {
+		page[0] = ch + i;
+		pwrite(fd, page, block_size, get_offset(addrs[i], block_size));
+		handle = release_tx(fd);
+		takeover_tx(fd, handle);
+	}
+
+	end_tx(fd);
 
 }
 
 void test_subblock_tx(int fd, char *page, int block_size) {
+	int i;
+	int addrs_size = 8;
+	off_t addrs[] = {0, 1, 2, 3, 4, 5, 6, 7};
+	int ch = '1';
+
 	begin_tx(fd);
-	mark_accessed(fd, 0, 9, 1, 1);
-	mark_accessed(fd, 1, 9, 0, 1);
-	mark_accessed(fd, 2, 9, 4, 4);
-	mark_accessed(fd, 3, 9, 6, 1);
-	mark_accessed(fd, 4, 9, 7, 1);
+
+	for (i = 0; i < addrs_size; i++) {
+		memset(page, 0, block_size);
+		page[i * 512] = ch + i;
+		pwrite(fd, page, block_size, get_offset(0, block_size));
+		mark_accessed(fd, i, 9, i, 1);
+	}
+
 	end_tx(fd);
+
+	begin_tx(fd);
+	pread(fd, page, block_size, get_offset(0, block_size));
+	end_tx(fd);
+
+	fprintf(stdout, "Read: ");
+	for (i = 0; i < addrs_size; i++) {
+		fprintf(stdout, "%c", page[i * 512]);
+	}
+	fprintf(stdout, "\n");
+
 }
 
 void test_read_only_tx(int fd, char *page, int block_size) {
 	int i;
 	int addrs_size = 8;
-	off_t addrs[] = {0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7};
+	off_t addrs[] = {0, 1, 2, 3, 4, 5, 6, 7};
 
 	begin_tx(fd);
 
+	fprintf(stdout, "Read: ");
 	for (i = 0; i < addrs_size; i++) {
 		pread(fd, page, block_size, get_offset(addrs[i], block_size));
 		fprintf(stdout, "%c", page[0]);
@@ -57,8 +96,8 @@ void test_read_only_tx(int fd, char *page, int block_size) {
 
 void test_write_only_tx(int fd, char *page, int block_size) {
 	int i;
-	int addrs_size = 16;
-	off_t addrs[] = {0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7};
+	int addrs_size = 8;
+	off_t addrs[] = {0, 1, 2, 3, 4, 5, 6, 7};
 	int ch = 'A';
 
 	begin_tx(fd);
@@ -74,7 +113,7 @@ void test_write_only_tx(int fd, char *page, int block_size) {
 void test_read_write_tx(int fd, char *page, int block_size) {
 	int i;
 	int addrs_size = 8;
-	off_t addrs[] = {0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7};
+	off_t addrs[] = {0, 1, 2, 3, 4, 5, 6, 7};
 	int ch = 'a';
 
 	begin_tx(fd);
@@ -83,6 +122,7 @@ void test_read_write_tx(int fd, char *page, int block_size) {
 		page[0] = ch + i;
 		pwrite(fd, page, block_size, get_offset(addrs[i], block_size));
 	}
+	fprintf(stdout, "Read: ");
 	for (i = 0; i < addrs_size; i++) {
 		pread(fd, page, block_size, get_offset(addrs[i], block_size));
 		fprintf(stdout, "%c", page[0]);
@@ -128,12 +168,14 @@ int main(int argc, char *argv[])
 	fd = open("/dev/mapper/dm-tx", O_DIRECT | O_RDWR);
         assert (fd >= 0);
 
-	test_get_versions(fd);
 	test_write_only_tx(fd, page, block_size);
 	test_read_only_tx(fd, page, block_size);
 	test_read_write_tx(fd, page, block_size);
 	test_read_only_tx(fd, page, block_size);
 	test_abort_tx(fd);
+	test_subblock_tx(fd, page, block_size);
+	test_release_takeover_tx(fd, page, block_size);
+	test_get_versions(fd);
 
 	munmap(page, block_size);
 	close(fd);

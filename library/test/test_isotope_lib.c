@@ -135,7 +135,9 @@ int main(int argc, char *argv[])
 	test_read_only_tx(fd, page, block_size);
 	test_abort_tx(fd);
 
+	munmap(page, block_size);
 	close(fd);
+
 	return 0;
 }
 

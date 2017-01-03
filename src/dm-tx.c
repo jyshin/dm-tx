@@ -3388,15 +3388,8 @@ static int process_tx_success(struct dm_tx *dmtx, struct proc_info *pi)
 	make_tx_visible(dmi, txr);
 	txr->state = 4;
 
-	if (list_is_only_item(&txr->record_list, &dmi->tx_record_list)) {
-		list_del(&txr->record_list);
-		spin_unlock_irqrestore(&dmi->tx_record_list_lock, flags);
-
-		clean_up_and_free_txr(txr);
-	} else {
-		try_to_clean_up_txr(dmi);
-		spin_unlock_irqrestore(&dmi->tx_record_list_lock, flags);
-	}
+	try_to_clean_up_txr(dmi);
+	spin_unlock_irqrestore(&dmi->tx_record_list_lock, flags);
 
 	return 0;
 

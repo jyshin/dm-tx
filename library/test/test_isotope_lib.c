@@ -21,8 +21,13 @@ static inline off_t get_offset(off_t addr, int block_size) {
 
 void test_get_versions(int fd) {
 	unsigned int version;
+
+	begin_tx(fd);
+
 	version = get_curr_ver(fd);
 	version = get_oldest_ver(fd);
+
+	end_tx(fd);
 }
 
 void test_set_cached(int fd, unsigned int addr) {
@@ -35,6 +40,7 @@ void test_release_takeover_tx(int fd, char *page, int block_size) {
 	off_t addrs[] = {0, 1, 2, 3, 4, 5, 6, 7};
 	int ch = 'i';
 	unsigned int handle;
+
 	begin_tx(fd);
 
 	for (i = 0; i < addrs_size; i++) {
@@ -138,6 +144,48 @@ void test_abort_tx(int fd) {
 	end_tx(fd);
 }
 
+void test_conflicting_txes(int fd, char *page, int block_size) {
+	int i;
+	int addrs_size = 8;
+	off_t addrs[] = {0, 1, 2, 3, 4, 5, 6, 7};
+	int ch;
+	unsigned int handle;
+	begin_tx(fd);
+
+	ch = 'a';
+	for (i = 0; i < addrs_size; i++) {
+		page[0] = ch + i;
+		pwrite(fd, page, block_size, get_offset(addrs[i], block_size));
+		pread(fd, page, block_size, get_offset(addrs[i], block_size));
+	}
+	handle = release_tx(fd);
+
+	begin_tx(fd);
+
+	ch = 'A';
+	for (i = 0; i < addrs_size; i++) {
+		page[0] = ch + i;
+		pwrite(fd, page, block_size, get_offset(addrs[i], block_size));
+		pread(fd, page, block_size, get_offset(addrs[i], block_size));
+	}
+
+	end_tx(fd);
+
+	takeover_tx(fd, handle);
+	end_tx(fd);
+
+	begin_tx(fd);
+
+	fprintf(stdout, "Read: ");
+	for (i = 0; i < addrs_size; i++) {
+		pread(fd, page, block_size, get_offset(addrs[i], block_size));
+		fprintf(stdout, "%c", page[0]);
+	}
+	fprintf(stdout, "\n");
+
+	end_tx(fd);
+}
+
 int main(int argc, char *argv[])
 {
 	char *page;
@@ -176,6 +224,7 @@ int main(int argc, char *argv[])
 	test_subblock_tx(fd, page, block_size);
 	test_release_takeover_tx(fd, page, block_size);
 	test_get_versions(fd);
+	test_conflicting_txes(fd, page, block_size);
 
 	munmap(page, block_size);
 	close(fd);

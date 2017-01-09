@@ -94,8 +94,10 @@
 #define NUM_EXT_DIRTY_BITS (GECKO_BLOCK_SIZE >> 4)
 #define NUM_EXT_DIRTY_BYTES (NUM_EXT_DIRTY_BITS >> 3)
 
+#define DMTX_ARG_MIN_CNT		12
+#define DMTX_ARG_AFTER_BDEV_CNT		6
 #define DMTX_CREATE_CMD "dmsetup create [dm-name] [start_addr] [end_addr]" \
-	"[dev-name] [persist: 0|1] [meta file path] " \
+	"[dev-name] [persist: 0|1] [meta file path] [txr file path]" \
 	"[blkdev layout: gecko] [# blkdev] " \
 	"[blkdev paths: as many as # blkdev]+ " \
 	"[segment size (MB): power of 2] " \
@@ -318,11 +320,13 @@ struct dm_isotope {
 
 	u32 request_id;		// Used for tagging I/O requests
 
-	u64 curr_ver;		// Currently visible version to users 
+	u64 curr_ver;		// Currently visible version to users
 	u64 outstanding_ver;	// Latest version that is being committed
 	u64 oldest_ver;		// Oldest available version (GC limit)
 
 	struct list_head tx_record_list;	// Completed tx records
+	char *txr_filename;
+
 	struct list_head tx_proc_info_list;	// List of proc_info doing tx
 
 	struct list_head *proc_info_list_map;	// Chained hashmap for all
@@ -343,7 +347,7 @@ struct dm_isotope {
 						// txr->success, txr->state,
 						// and, txr->end_ver.
 	spinlock_t tx_proc_info_list_lock;	// locks tx_proc_info_list
-	spinlock_t proc_info_list_map_lock;	// locks proc_info_list_map, 
+	spinlock_t proc_info_list_map_lock;	// locks proc_info_list_map,
 						// and nr_proc
 	spinlock_t tmp_proc_info_list_map_lock; // locks tmp_proc_info_list_map
 						// and nr_tmp_proc
@@ -398,6 +402,7 @@ struct dm_tx_stats {
 struct ctr_args {
 	int persistent;
 	char *meta_filename;
+	char *txr_filename;
 
 	char *blkdev_layout;
 	int nr_blkdevs;
@@ -1849,7 +1854,8 @@ static struct dm_dev_info *dev_info_alloc_and_init(gfp_t flags)
 	return dev;
 }
 
-static int init_isotope(struct dm_target *ti, struct dm_isotope *dmi)
+static int init_isotope(struct dm_target *ti, struct dm_isotope *dmi,
+			struct ctr_args *args)
 {
 	int i;
 
@@ -1862,6 +1868,13 @@ static int init_isotope(struct dm_target *ti, struct dm_isotope *dmi)
 	dmi->oldest_ver = 0;
 
 	INIT_LIST_HEAD(&dmi->tx_record_list);
+	dmi->txr_filename = kstrdup(args->txr_filename, GFP_KERNEL);
+	if (!dmi->txr_filename) {
+		ti->error = DM_TX_PREFIX "unable to kstrdup txr-filename";
+		goto err_out;
+	}
+
+
 	INIT_LIST_HEAD(&dmi->tx_proc_info_list);
 	dmi->proc_info_list_map = kmalloc(sizeof(struct list_head) *
 					  HASH_TABLE_SIZE,
@@ -1869,7 +1882,7 @@ static int init_isotope(struct dm_target *ti, struct dm_isotope *dmi)
 	if (!dmi->proc_info_list_map) {
 		ti->error = DM_TX_PREFIX "kzalloc to proc_info_list_map "
 			"failed";
-		goto err_out;
+		goto free_txr_filename_and_out;
 	}
 	for (i = 0; i < HASH_TABLE_SIZE; i++)
 		INIT_LIST_HEAD(&dmi->proc_info_list_map[i]);
@@ -1907,6 +1920,8 @@ free_tmp_proc_info_list_map_and_out:
 	kfree(dmi->tmp_proc_info_list_map);
 free_proc_info_list_map_and_out:
 	kfree(dmi->proc_info_list_map);
+free_txr_filename_and_out:
+	kfree(dmi->txr_filename);
 err_out:
 	return -ENOMEM;
 }
@@ -1916,6 +1931,7 @@ static void destroy_isotope(struct dm_isotope *dmi)
 	free_percpu(dmi->stats);
 	kfree(dmi->tmp_proc_info_list_map);
 	kfree(dmi->proc_info_list_map);
+	kfree(dmi->txr_filename);
 }
 
 static int init_gecko(struct dm_target *ti, struct dm_gecko *dmg,
@@ -2158,13 +2174,14 @@ static int read_ctr_args(struct dm_target *ti, struct ctr_args *args,
 	int i;
 	int err;
 	int idx = 0;
-	if (argc < 5) {
+	if (argc < DMTX_ARG_MIN_CNT) {
 		ti->error = "not enough args:\n" DMTX_CREATE_CMD "\n";
 		err = -EINVAL;
 		goto err_out;
 	}
 
 	// persistent data map related
+	// TODO: use of metadata (data index)
 	if ((err = read_positive_long(argv[idx++], &args->persistent,
 				      ti, "invalid persistence arg\n"))) {
 		goto err_out;
@@ -2173,7 +2190,12 @@ static int read_ctr_args(struct dm_target *ti, struct ctr_args *args,
 	args->meta_filename = argv[idx++];
 	printk(DM_TX_PREFIX "args->meta_filename %s\n", args->meta_filename);
 
-	// blkdev related 
+	// tx record related
+	args->txr_filename = argv[idx++];
+	printk(DM_TX_PREFIX "args->txr_filename %s\n", args->txr_filename);
+
+
+	// blkdev related
 	args->blkdev_layout = argv[idx++];
 	printk(DM_TX_PREFIX "args->blkdev_layout %s\n", args->blkdev_layout);
 	if ((err = read_positive_long(argv[idx++], &args->nr_blkdevs,
@@ -2186,7 +2208,7 @@ static int read_ctr_args(struct dm_target *ti, struct ctr_args *args,
 	}
 	printk(DM_TX_PREFIX "args->nr_blkdevs %d\n", args->nr_blkdevs);
 
-	if (args->nr_blkdevs + 5 > argc - idx) {
+	if (args->nr_blkdevs + DMTX_ARG_AFTER_BDEV_CNT > argc - idx) {
 		ti->error = "not enough args:\n" DMTX_CREATE_CMD "\n";
 		err = -EINVAL;
 		goto err_out;
@@ -2206,6 +2228,7 @@ static int read_ctr_args(struct dm_target *ti, struct ctr_args *args,
 	printk(DM_TX_PREFIX "args->seg_size_mb %d\n", args->seg_size_mb);
 
 	// ssd cache related
+	// TODO: use of SSD cache is not implemented.
 	args->ssd_cache_policy = argv[idx++];
 	printk(DM_TX_PREFIX "args->ssd_cache_policy %s\n",
 	       args->ssd_cache_policy);
@@ -2246,11 +2269,9 @@ int init_dm_tx(struct dm_target *ti, struct dm_tx *dmtx,
 	dmtx->meta_filename = kstrdup(args->meta_filename, GFP_KERNEL);
 	if (!dmtx->meta_filename) {
 		ti->error = DM_TX_PREFIX "unable to kstrdup meta-filename";
-		printk("%s\n", ti->error);
 		err = -ENOMEM;
 		goto err_out;
 	}
-	printk(DM_TX_PREFIX "meta_filename %s\n", dmtx->meta_filename);
 
 	if (strcmp(args->blkdev_layout, "gecko") == 0) {
 		dmtx->blkdev_layout = BLKDEV_LAYOUT_GECKO;
@@ -2312,7 +2333,7 @@ static int dm_tx_ctr(struct dm_target *ti, unsigned int argc, char *argv[])
 		err = -ENOMEM;
 		goto destroy_dmtx_and_out;
 	}
-	if((err = init_isotope(ti, dmi))) {
+	if((err = init_isotope(ti, dmi, &args))) {
 		goto free_isotope_and_out;
 	}
 
@@ -3165,7 +3186,8 @@ struct tx_io_meta {
 };
 
 // TODO: accessed_bits are not included
-static int persist_tx_record(struct tx_record *txr)
+// TODO: writing to a file from the kernel is not the best way to do this.
+static int persist_tx_record(struct dm_isotope *dmi, struct tx_record *txr)
 {
 	struct file *file = NULL;
 	loff_t pos = 0;
@@ -3191,7 +3213,7 @@ static int persist_tx_record(struct tx_record *txr)
 	}
 
 	set_fs(KERNEL_DS);
-	file = filp_open("/tmp/gecko_tx_record", O_LARGEFILE | O_WRONLY |
+	file = filp_open(dmi->txr_filename, O_LARGEFILE | O_WRONLY |
 			 O_CREAT | O_APPEND, 0644);
 	if (!file) {
 		spin_lock_irqsave(&txr->lock, flags);
@@ -3366,7 +3388,7 @@ static int process_tx_success(struct dm_tx *dmtx, struct proc_info *pi)
 
 	// 4. Flush tx_record to flash
 	// FIX: versioned dev ops start
-	if (persist_tx_record(txr)) {
+	if (persist_tx_record(dmi, txr)) {
 		// FIX: versioned dev ops end 
 		IOCPRINTK("(%d): FTX Persist TXR failed", current->pid);
 		goto err_out;
@@ -3407,7 +3429,7 @@ static void process_tx_failure(struct dm_isotope *dmi,
 	wait_event_interruptible(pi->tx_io_wait_queue,
 				 atomic_read(&pi->nr_outstanding_io) == 0);
 
-	if(persist_tx_record(txr)) {
+	if(persist_tx_record(dmi, txr)) {
 		IOCPRINTK("(%d): FTX Persist TXR failed", current->pid);
 	}
 	wait_event_interruptible(txr->prior_tx_wait_queue,

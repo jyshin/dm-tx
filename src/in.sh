@@ -2,7 +2,8 @@
 
 MODNAME="dm-tx_mod"
 NAME="dm-tx"
-META_FILE="/tmp/foo"
+META_FILE="/tmp/dmtx-meta"
+TXR_FILE="/tmp/dmtx-txr"
 
 if [ $# -ne 7 -a $# -ne 8 ]; then
 	echo "Usage $0 <init-from-persistent-store (1=true | 0=false)> segment size in block (e.g. 4096) layout (linear | raid1 | raid0) <number of stripes> cache layout (tailonly | tailnbody | shared) cache policy (fifo | lru)"
@@ -60,9 +61,9 @@ echo "- Internal memory cache (type: $MEM_CACHE_POLICY) size: $MEM_CACHE_SIZE_MB
 echo "- Logging segment size: $SEG_SIZE_MB MB"
 
 
-echo sudo dmsetup create target startaddr endaddr target persist metafilepath blkdevlayout numblkdevs blkdevlist segsize ssdcachepolicy ssdpath ssdcachesizemb memcachepolicy memcachesizemb
-echo sudo dmsetup create $NAME 0 $DEV_SIZE dm-tx $PERSIST $META_FILE $BLKDEV_LAYOUT $NUM_BLKDEVS $BLKDEV_LIST $SEG_SIZE_MB $SSD_CACHE_POLICY /dev/sde $SSD_CACHE_SIZE_MB $MEM_CACHE_POLICY $MEM_CACHE_SIZE_MB 
+echo sudo dmsetup create target startaddr endaddr target persist metafilepath txrfilepath blkdevlayout numblkdevs blkdevlist segsize ssdcachepolicy ssdpath ssdcachesizemb memcachepolicy memcachesizemb
+echo sudo dmsetup create $NAME 0 $DEV_SIZE dm-tx $PERSIST $META_FILE $TXR_FILE $BLKDEV_LAYOUT $NUM_BLKDEVS $BLKDEV_LIST $SEG_SIZE_MB $SSD_CACHE_POLICY /dev/sde $SSD_CACHE_SIZE_MB $MEM_CACHE_POLICY $MEM_CACHE_SIZE_MB 
 
-echo 0 ${DEV_SIZE} dm-tx $PERSIST $META_FILE $BLKDEV_LAYOUT $NUM_BLKDEVS $BLKDEV_LIST $SEG_SIZE_MB \
+echo 0 ${DEV_SIZE} dm-tx $PERSIST $META_FILE $TXR_FILE $BLKDEV_LAYOUT $NUM_BLKDEVS $BLKDEV_LIST $SEG_SIZE_MB \
 	$SSD_CACHE_POLICY /dev/sde $SSD_CACHE_SIZE_MB $MEM_CACHE_POLICY $MEM_CACHE_SIZE_MB \
 	| sudo dmsetup create "${NAME}"
